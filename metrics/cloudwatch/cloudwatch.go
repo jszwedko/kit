@@ -3,6 +3,7 @@ package cloudwatch
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"strconv"
 	"sync"
@@ -23,6 +24,13 @@ const (
 	maxValuesInABatch     = 150
 )
 
+type HistogramStrategy int
+
+const (
+	HistogramStrategyPercentiles HistogramStrategy = iota
+	HistogramStrategySample
+)
+
 type Percentiles []struct {
 	s string
 	f float64
@@ -41,6 +49,7 @@ type CloudWatch struct {
 	counters              *lv.Space
 	gauges                *lv.Space
 	histograms            *lv.Space
+	histogramStrategy     HistogramStrategy
 	percentiles           []float64 // percentiles to track
 	logger                log.Logger
 	numConcurrentRequests int
@@ -60,8 +69,17 @@ func WithLogger(logger log.Logger) option {
 	}
 }
 
+func WithHistogramStategy(strategy HistogramStrategy) option {
+	return func(c *CloudWatch) {
+		c.histogramStrategy = strategy
+	}
+}
+
 // WithPercentiles registers the percentiles to track, overriding the
 // existing/default values.
+//
+// Only valid with HistogramStrategyPercentiles (the default)
+//
 // Reason is that Cloudwatch makes you pay per metric, so you can save half the money
 // by only using 2 metrics instead of the default 4.
 func WithPercentiles(percentiles ...float64) option {
@@ -97,6 +115,7 @@ func New(namespace string, svc cloudwatchiface.CloudWatchAPI, options ...option)
 		counters:              lv.NewSpace(),
 		gauges:                lv.NewSpace(),
 		histograms:            lv.NewSpace(),
+		histogramStrategy:     HistogramStrategyPercentiles,
 		numConcurrentRequests: 10,
 		logger:                log.NewLogfmtLogger(os.Stderr),
 		percentiles:           []float64{0.50, 0.90, 0.95, 0.99},
@@ -213,20 +232,55 @@ func (cw *CloudWatch) Send() error {
 	}
 
 	cw.histograms.Reset().Walk(func(name string, lvs lv.LabelValues, values []float64) bool {
-		histogram := generic.NewHistogram(name, 50)
+		switch cw.histogramStrategy {
+		case HistogramStrategyPercentiles:
+			histogram := generic.NewHistogram(name, 50)
 
-		for _, v := range values {
-			histogram.Observe(v)
-		}
+			for _, v := range values {
+				histogram.Observe(v)
+			}
 
-		for _, perc := range cw.percentiles {
-			value := histogram.Quantile(perc)
-			datums = append(datums, &cloudwatch.MetricDatum{
-				MetricName: aws.String(fmt.Sprintf("%s_%s", name, formatPerc(perc))),
+			for _, perc := range cw.percentiles {
+				value := histogram.Quantile(perc)
+				datums = append(datums, &cloudwatch.MetricDatum{
+					MetricName: aws.String(fmt.Sprintf("%s_%s", name, formatPerc(perc))),
+					Dimensions: makeDimensions(lvs...),
+					Value:      aws.Float64(value),
+					Timestamp:  aws.Time(now),
+				})
+			}
+
+		case HistogramStrategySample:
+			datum := &cloudwatch.MetricDatum{
+				MetricName: aws.String(name),
 				Dimensions: makeDimensions(lvs...),
-				Value:      aws.Float64(value),
 				Timestamp:  aws.Time(now),
+			}
+
+			// shuffle so will choose a sample less than the maxValuesInABatch randomly
+			rand.Shuffle(len(values), func(i, j int) {
+				values[i], values[j] = values[j], values[i]
 			})
+
+			// CloudWatch Put Metrics API (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_MetricDatum.html)
+			// expects batch of unique values including the array of corresponding counts
+			valuesCounter := make(map[float64]int)
+			for _, v := range values {
+				valuesCounter[v]++
+			}
+
+			for value, count := range valuesCounter {
+				if len(datum.Values) == maxValuesInABatch {
+					break
+				}
+				datum.Values = append(datum.Values, aws.Float64(value))
+				datum.Counts = append(datum.Counts, aws.Float64(float64(count)))
+			}
+
+			datums = append(datums, datum)
+
+		default:
+			panic("unknown HistogramStrategy")
 		}
 		return true
 	})
